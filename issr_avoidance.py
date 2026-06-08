@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 
 from pycontrails import Flight, MetDataset, models
 from pycontrails.core.models import Model
+from pycontrails.core.fuel import Fuel, SAFBlend
 from pycontrails.models.emissions import Emissions
 from pycontrails.models.ps_model import PSFlight
 from pycontrails.physics import constants, geo, thermo, units
@@ -46,25 +47,15 @@ class SimParams:
 class FlParams:
     """Default flight/fleet parameters."""
     # Synthetic focal-point trajectory controls
-    n_ac: int = 1
-    ac_type: str = "A320"
+    n_ac: int = 1 # number of aircraft 
+    ac_type: str = "A320" # aircraft type for performance and emissions calculations
+    pct_blend: float = 0.0 # percentage of SAF blend in fuel (0-100)
+    
     fl_heading: float | list[float] = 90.0          # deg, 0=N, 90=E
     fl_speed: float | list[float] = 230.0           # m/s
     fl_altitude: float | list[float] | None = None  # m; None → midpoint of alt_bounds
 
-    fl_t_cross_s: float | list[float] | None = 1800.0
-    fl_sep_time_s: float = 0.0
-
     fl_entry_time_s: float | list[float] | None = None
-
-    fl_focal_lat: float | None = None
-    fl_focal_lon: float | None = None
-    fl_focal_alt: float | None = None  # m; None → midpoint of alt_bounds
-
-    fl_cross_track_offset_m: float | list[float] = 0.0
-    fl_altitude_offset_m: float | list[float] = 0.0
-
-    domain_padding_m: float = 0.0
 
 @dataclass
 class ContrailParams:
@@ -85,22 +76,10 @@ class ISSRAvoidance(Model):
 
     def __init__(self,
                 sim_params: SimParams,
-                fl_params: Optional[FlParams] = None,
-                contrail_params: Optional[ContrailParams] = None,
-                met_params: Optional[MetParams] = None):
+                fl_params: FlParams,
+                contrail_params: ContrailParams,
+                met_params: MetParams):
         super().__init__()
-
-        # Apply defaults for Eulerian-only / param-sweep mode (no flights/plumes needed)
-        if fl_params is None:
-            fl_params = FlParams(n_ac=0, mode="synthetic")
-        if contrail_params is None:
-            contrail_params = ContrailParams()
-        if met_params is None:
-            met_params = MetParams()
-
-        # param_axes mode is always plume-free
-        if sim_params.param_axes is not None:
-            fl_params.n_ac = 0
 
         # Build spatial grid from current bounds
         self._build_grid(sim_params)
@@ -134,50 +113,6 @@ class ISSRAvoidance(Model):
             freq=sim_params.t_out[1],
         )
 
-        # Set up paths and job ID
-        self.run_path = sim_params.run_path
-        self.data_path = sim_params.data_path
-        self.job_id = sim_params.job_id
-
-        # If running in direct mode with a specified flight file, derive job_id from the filename if not already set.
-        if fl_params.mode == "opensky" and fl_params.file is not None:
-            self.job_id = os.path.splitext(os.path.basename(fl_params.file))[0]
-
-        sim_params.date_created = pd.Timestamp.now()
-
-        # Grab species numbers from the input files for later use in indexing model outputs
-        chem_params.species_emi_num = grab_species_num(self.run_path, chem_params.species_emi)
-        if fl_params.n_ac > 0:
-            chem_params.species_pl_num = grab_species_num(self.run_path, chem_params.species_pl)
-        else:
-            chem_params.species_pl_num = np.array([], dtype=int)
-        chem_params.species_out_num = grab_species_num(self.run_path, chem_params.species_out)
-        chem_params.species_boxm_num = grab_species_num_boxm(self.run_path)
-
-        # Validate species and time hierarchies
-        validate_species_hierarchy(chem_params)
-        if fl_params.n_ac > 0:
-            validate_time_hierarchy(sim_params)
-
-        # Per-run directory: data/<config_family>/<job_id>/
-        self.run_dir = self.data_path + self.job_id + "/"
-
-        # Shared global inputs: data/glob/
-        self.inputs_glob = str(Path(self.run_path) / "data" / "glob") + "/"
-
-        # Backward-compatible aliases, if other code still uses these names
-        self.inputs_job = self.run_dir
-        self.outputs_job = self.run_dir
-
-        # If job dirs exist, clear and recreate
-        if os.path.exists(self.inputs_job):
-            shutil.rmtree(self.inputs_job)
-
-        if os.path.exists(self.outputs_job):
-            shutil.rmtree(self.outputs_job)
-
-        os.makedirs(self.inputs_job, exist_ok=True)
-        os.makedirs(self.outputs_job, exist_ok=True)      
 
         all_params = {
             "sim_params": sim_params,
@@ -192,10 +127,6 @@ class ISSRAvoidance(Model):
         self.contrail_params = contrail_params
         self.met_params = met_params
         self.all_params = all_params
-
-        # Set up the model classes for preprocessing and running GPAT
-        self.setup = GPATSetup(self)
-        self.run = GPATRun(self)
 
     def _build_grid(self, sim_params):
         """Build coarse grid vectors and meter axes from sim_params bounds.
@@ -378,12 +309,15 @@ class ISSRAvoidance(Model):
 
         return met
 
-    def assign_saf(self):
+    def assign_saf(self, 
+                   pct_blend: float):
         saf=SAFBlend(pct_blend)
         fl_saf=fl.copy()
 
         fl_saf.attrs["aircraft_type"] = "A320"
         fl_saf.fuel = saf
+
+
 
     def preprocess(self):
         # Generate flight trajectory points
