@@ -18,7 +18,7 @@ class SimParams:
     """Default simulation parameters."""
     # Temporal domain
     
-    # flight time
+    # flight time - sampled waypoints at e.g. 2 min intervals for 1 hr
     t_fl: tuple[pd.Timestamp, pd.Timedelta, pd.Timedelta] = field(
         default_factory=lambda: (
             pd.to_datetime("2025-01-20 13:00:00"),
@@ -27,8 +27,8 @@ class SimParams:
         )
     )  # (start time, time step, run time)
 
-    # contrail time
-    t_contrail: tuple[pd.Timestamp, pd.Timedelta, pd.Timedelta] = field(
+    # contrail time - the time vector for the contrail simulation, representing the sampling 
+    t_con: tuple[pd.Timestamp, pd.Timedelta, pd.Timedelta] = field(
         default_factory=lambda: (
             pd.to_datetime("2025-01-20 13:00:00"),
             pd.Timedelta(minutes=2),
@@ -37,7 +37,7 @@ class SimParams:
     )  # (start time, time step, run time)
 
     #  spatial domain
-    lat_bounds: tuple[float, float] = (0.0, 1.0)  # lat bounds [deg]
+    ref_lat: float = 0.0  # reference latitude for local Cartesian grid [deg]
     lon_bounds: tuple[float, float] = (0.0, 1.0)  # lon bounds [deg]
     alt_bounds: tuple[float, float] = (12000, 13000)  # alt bounds [m]
     hres_sim: float = 0.01  # horizontal resolution [deg]
@@ -47,15 +47,13 @@ class SimParams:
 class FlParams:
     """Default flight/fleet parameters."""
     # Synthetic focal-point trajectory controls
-    n_ac: int = 1 # number of aircraft 
     ac_type: str = "A320" # aircraft type for performance and emissions calculations
     pct_blend: float = 0.0 # percentage of SAF blend in fuel (0-100)
     
-    fl_heading: float | list[float] = 90.0          # deg, 0=N, 90=E
     fl_speed: float | list[float] = 230.0           # m/s
-    fl_altitude: float | list[float] | None = None  # m; None → midpoint of alt_bounds
-
-    fl_entry_time_s: float | list[float] | None = None
+    fl_target_alt: float | list[float] | None = None  # m; None → midpoint of alt_bounds
+    fl_div_frac: float | list[float] = 0.5            # m; distance between parallel flight paths in synthetic formation
+    fl_rocd: float | list[float] = 0.0             # m/s; positive = climb, negative = descent
 
 @dataclass
 class ContrailParams:
@@ -72,53 +70,43 @@ class MetParams:
     lagrangian_tendency_of_air_pressure: float | None = 0.0  # Pa/s
     air_temperature: float | None = 220.0  # K
 
+@dataclass
+class ISSRParams:
+    """Default parameters for the ISSR model representation."""
+    issr_centroid: tuple[float, float] = (0.5, 12500)  # (lat, alt) of ISSR centroid [deg, m]
+
 class ISSRAvoidance(Model):
 
     def __init__(self,
                 sim_params: SimParams,
                 fl_params: FlParams,
                 contrail_params: ContrailParams,
-                met_params: MetParams):
+                met_params: MetParams,
+                issr_params: ISSRParams):
         super().__init__()
 
         # Build spatial grid from current bounds
         self._build_grid(sim_params)
 
         # Generate time vectors
-        if fl_params.n_ac > 0:
-            self.times_fl = pd.date_range(
-                start=sim_params.t_fl[0],
-                end=sim_params.t_fl[0] + sim_params.t_fl[2],
-                freq=sim_params.t_fl[1],
-            )
-
-            self.times_pl = pd.date_range(
-                start=sim_params.t_pl[0],
-                end=sim_params.t_sim[0] + sim_params.t_sim[2],
-                freq=sim_params.t_pl[1],
-            )
-        else:
-            self.times_fl = None
-            self.times_pl = None
-
-        self.times_sim = pd.date_range(
-            start=sim_params.t_sim[0],
-            end=sim_params.t_sim[0] + sim_params.t_sim[2],
-            freq=sim_params.t_sim[1],
+        self.times_fl = pd.date_range(
+            start=sim_params.t_fl[0],
+            end=sim_params.t_fl[0] + sim_params.t_fl[2],
+            freq=sim_params.t_fl[1],
         )
 
-        self.times_out = pd.date_range(
-            start=sim_params.t_out[0],
-            end=sim_params.t_out[0] + sim_params.t_out[2],
-            freq=sim_params.t_out[1],
+        self.times_con = pd.date_range(
+            start=sim_params.t_con[0],
+            end=sim_params.t_con[0] + sim_params.t_con[2],
+            freq=sim_params.t_con[1],
         )
-
-
+        
         all_params = {
             "sim_params": sim_params,
             "fl_params": fl_params,
             "contrail_params": contrail_params,
             "met_params": met_params,
+            "issr_params": issr_params,
         }
 
         # Set the model parameters
@@ -126,6 +114,7 @@ class ISSRAvoidance(Model):
         self.fl_params = fl_params
         self.contrail_params = contrail_params
         self.met_params = met_params
+        self.issr_params = issr_params
         self.all_params = all_params
 
     def _build_grid(self, sim_params):
@@ -136,10 +125,6 @@ class ISSRAvoidance(Model):
         each side so that DryAdvection can interpolate at flight
         waypoints near the domain boundary.
         """
-        if sim_params.param_axes is not None:
-            self._build_param_grid(sim_params)
-            return
-
         hres = sim_params.hres_sim
         vres = sim_params.vres_sim
         _eps = 1e-9  # tolerance so a one-cell domain (start == stop) still yields one point
@@ -200,117 +185,63 @@ class ISSRAvoidance(Model):
         """Generate flight trajectory points. Supports loading and plotting all test flights if requested."""
         fl_params = self.gpat.fl_params
 
-        # generate synthetic formation flight
-        if fl_params.mode == "synthetic":
-            return self._traj_gen_synthetic_focal()
+        # traj will by default be a single flight along the center of the domain, with entry and exit points of diversion to be calculated from fl_params input.
 
-        # grab data from opensky
-        if fl_params.mode == "opensky":
-            return self._traj_gen_opensky()
+
 
     def gen_met(self) -> MetDataset:
-        """Generate meteorology data.
-
-        Uses the padded met grid (``met_lons``, ``met_lats``,
-        ``met_levels``) so that DryAdvection can interpolate at flight
-        waypoints near the BOXM domain boundary.
-        """
-        if self.gpat.sim_params.param_axes is not None:
-            return self._gen_met_param_sweep()
+        """Generate meteorology data."""
 
         met_params = self.gpat.met_params
-        met_lons = self.gpat.met_lons
-        met_lats = self.gpat.met_lats
-        met_levels = self.gpat.met_levels
 
-        # Step 1: Create with STANDARD names for MetDataset validation
-        met_standard = xr.Dataset(
-            data_vars={
-                "eastward_wind": (
-                    ("time", "level", "latitude", "longitude"),
-                    np.full((len(self.gpat.times_sim), len(met_levels), len(met_lats), len(met_lons)), met_params.eastward_wind),
-                ),
-                "northward_wind": (
-                    ("time", "level", "latitude", "longitude"),
-                    np.full((len(self.gpat.times_sim), len(met_levels), len(met_lats), len(met_lons)), met_params.northward_wind),
-                ),
-                "lagrangian_tendency_of_air_pressure": (
-                    ("time", "level", "latitude", "longitude"),
-                    np.full((len(self.gpat.times_sim), len(met_levels), len(met_lats), len(met_lons)), met_params.lagrangian_tendency_of_air_pressure),
-                ),
-            },
-            coords={
-                "longitude": met_lons,
-                "latitude": met_lats,
-                "level": met_levels,
-                "time": pd.to_datetime(self.gpat.times_sim.values).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
+        time_bounds = (self.times_sim[0], self.times_sim[-1])
+
+        era5pl = ERA5(
+            time=time_bounds,
+            variables=Cocip.met_variables + Cocip.optional_met_variables,
+            pressure_levels=pressure_levels,
         )
+        era5sl = ERA5(time=time_bounds, variables=Cocip.rad_variables)
+
+
+        # # Step 1: Create with STANDARD names for MetDataset validation
+        # met_standard = xr.Dataset(
+        #     data_vars={
+        #         "eastward_wind": (
+        #             ("time", "level", "latitude", "longitude"),
+        #             np.full((len(self.gpat.times_sim), len(met_levels), len(met_lats), len(met_lons)), met_params.eastward_wind),
+        #         ),
+        #         "northward_wind": (
+        #             ("time", "level", "latitude", "longitude"),
+        #             np.full((len(self.gpat.times_sim), len(met_levels), len(met_lats), len(met_lons)), met_params.northward_wind),
+        #         ),
+        #         "lagrangian_tendency_of_air_pressure": (
+        #             ("time", "level", "latitude", "longitude"),
+        #             np.full((len(self.gpat.times_sim), len(met_levels), len(met_lats), len(met_lons)), met_params.lagrangian_tendency_of_air_pressure),
+        #         ),
+        #     },
+        #     coords={
+        #         "longitude": met_lons,
+        #         "latitude": met_lats,
+        #         "level": met_levels,
+        #         "time": pd.to_datetime(self.gpat.times_sim.values).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        #     },
+        # )
 
         # Step 2: Initialize MetDataset (validates standard names)
-        met = MetDataset(met_standard)
-
-        month = self.gpat.times_sim[0].month
-
-        # Step 3: Load and interpolate climatology with standard names
-        air_temperature = (
-            xr.open_dataarray(self.gpat.inputs_glob + "air_temperature.nc", engine="netcdf4")
-            .sel(month=month - 1)
-            .interp(
-                longitude=met_lons,
-                latitude=met_lats,
-                level=met_levels,
-                method="linear",
-                kwargs={"fill_value": "extrapolate"},
-            )
-            .broadcast_like(met.data["eastward_wind"])
-        )
-
-        h2o_concs = (
-            xr.open_dataarray(self.gpat.inputs_glob + "h2o_concs.nc", engine="netcdf4")
-            .sel(month=month - 1)
-            .interp(
-                longitude=met_lons,
-                latitude=met_lats,
-                level=met_levels,
-                method="linear",
-                kwargs={"fill_value": "extrapolate"},
-            )
-            .broadcast_like(met.data["eastward_wind"])
-        )
-        N_A = 6.022e23  # Avogadro's number
+        # met = MetDataset(met_standard)
         
-        # Add temp and H2O to met dataset
-        met.data["air_temperature"] = air_temperature
-        met.data["H2O"] = h2o_concs.transpose("latitude", "longitude", "level", "time")
-
-        # Calculate specific humidity and relative humidity
-        rho_d = met["air_pressure"].data / (constants.R_d * met["air_temperature"].data)
-        met.data["specific_humidity"] = met.data["H2O"] * constants.M_d / (N_A * rho_d * 1e-6)
-        met.data["relative_humidity"] = thermo.rhi(
-            met.data["specific_humidity"], met.data["air_temperature"], met.data["air_pressure"]
-        )
-
-        # Calculate number density of air (M) to feed into box model calcs
-        met.data["M"] = (N_A / constants.M_d) * rho_d * 1e-6  # [molecules / cm^3]
-        met.data["M"] = met.data["M"].transpose("latitude", "longitude", "level", "time")
-
-        # Calculate O2 and N2 number concs based on M
-        met.data["O2"] = 2.079e-01 * met.data["M"]
-        met.data["N2"] = 7.809e-01 * met.data["M"]
-
         # calculate solar zenith angle
-        met.data["sza"] = (
-            ("latitude", "longitude", "time"),
-            self._calc_sza(
-                met["latitude"].data.values, met["longitude"].data.values, met["time"].data.values
-            ),
-        )
+        # met.data["sza"] = (
+        #     ("latitude", "longitude", "time"),
+        #     self._calc_sza(
+        #         met["latitude"].data.values, met["longitude"].data.values, met["time"].data.values
+        #     ),
+        # )
 
         return met
 
-    def assign_saf(self, 
-                   pct_blend: float):
+    def assign_saf(self, pct_blend: float):
         saf=SAFBlend(pct_blend)
         fl_saf=fl.copy()
 
