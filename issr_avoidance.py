@@ -126,16 +126,16 @@ class SimParams:
     t_con: tuple = field(
         default_factory=lambda: (
             pd.to_datetime("2025-01-20 13:00:00"),
-            pd.Timedelta(minutes=1),
+            pd.Timedelta(hours=1),
             pd.Timedelta(hours=12),
         )
     )
     """(start, dt, duration) for the contrail / met time axis."""
 
     # -- Spatial domain --
-    lon_bounds: tuple[float, float] = (0.0, 4.0)        # [°]
+    lon_bounds: tuple[float, float] = (0.0, 8.0)        # [°] — wide enough for ~10 m/s wind × 12 h advection (~3.9°) plus flight path
     lat_bounds: tuple[float, float] = (0.0, 2.0)        # [°]
-    alt_bounds: tuple[float, float] = (11000.0, 13000.0)  # [m]
+    alt_bounds: tuple[float, float] = (10000.0, 14000.0)  # [m] — wide enough to cover avoidance strategies (±1500 m from 12 km ISSR)
     hres_sim: float = 0.25    # horizontal resolution [°]
     vres_sim: float = 500.0   # vertical resolution [m]
 
@@ -150,6 +150,9 @@ class FlParams:
     fl_target_alt: float | None = None
     """Cruise altitude [m]. ``None`` → midpoint of ``alt_bounds``."""
     fl_alt_delta: float = 1500.0    # altitude shift for avoidance strategies [m]
+    fl_lon_bounds: tuple[float, float] = (0.0, 4.0)
+    """Flight longitude range [°]. Narrower than the met domain so advected
+    contrails stay inside the wider met domain throughout the simulation."""
 
 
 @dataclass
@@ -166,7 +169,7 @@ class MetParams:
     """Uniform background atmospheric state."""
 
     air_temperature: float = 220.0                    # [K]
-    eastward_wind: float = 10.0                       # [m s⁻¹]
+    eastward_wind: float = 0.0                       # [m s⁻¹]
     northward_wind: float = 0.0                       # [m s⁻¹]
     lagrangian_tendency_of_air_pressure: float = 0.0  # [Pa s⁻¹]
 
@@ -187,7 +190,7 @@ class ISSRParams:
     """
 
     issr_centroid: tuple[float, float, float] = (2.0, 1.0, 12000.0)
-    """(lon [°], lat [°], alt [m]) of the ISSR peak."""
+    """(lon [°], lat [°], alt [m]) of the ISSR peak. Placed in western half so the contrail advects through it."""
 
     sigma_parallel: float = 150_000.0   # along-track (longitude) half-width [m]
     sigma_perp: float = 50_000.0        # across-track (latitude) half-width [m]
@@ -384,7 +387,7 @@ class ISSRAvoidance(Model):
 
         df = pd.DataFrame(
             {
-                "longitude": np.linspace(sp.lon_bounds[0], sp.lon_bounds[1], n_wp),
+                "longitude": np.linspace(fp.fl_lon_bounds[0], fp.fl_lon_bounds[1], n_wp),
                 "latitude": np.full(n_wp, lat_mid),
                 "altitude": np.full(n_wp, float(alt)),
                 "time": self.times_fl,
@@ -596,7 +599,13 @@ class ISSRAvoidance(Model):
             Lagrangian contrail segments; ``None`` if no persistent contrails
             formed.
         """
-        cocip = Cocip(met=met, rad=rad, **cocip_kwargs)
+        cocip = Cocip(
+            met=met,
+            rad=rad,
+            dt_integration=np.timedelta64(1, "h"),  # match 1-hour met time step
+            max_age=self.sim_params.t_con[2],        # stop tracking at end of met domain
+            **cocip_kwargs,
+        )
         fl_out = cocip.eval(fl)
         return fl_out, cocip.contrail
 
@@ -974,9 +983,9 @@ class ISSRAvoidance(Model):
 if __name__ == "__main__":
     # Customise any parameters here before running
     sim_params = SimParams(
-        lon_bounds=(0.0, 4.0),
+        lon_bounds=(0.0, 8.0),        # extra room for eastward wind advection
         lat_bounds=(0.0, 2.0),
-        alt_bounds=(11000.0, 13000.0),
+        alt_bounds=(10000.0, 14000.0),  # covers ±1500 m avoidance from 12 km ISSR
         hres_sim=0.25,
         vres_sim=500.0,
     )
@@ -984,7 +993,7 @@ if __name__ == "__main__":
         issr_centroid=(2.0, 1.0, 12000.0),
         sigma_parallel=150_000.0,
         sigma_perp=50_000.0,
-        sigma_z=500.0,
+        sigma_z=3000.0,
         rhi_bg=0.75,
         rhi_peak=1.20,
     )
