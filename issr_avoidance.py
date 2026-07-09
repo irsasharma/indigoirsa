@@ -1,109 +1,52 @@
 """
 issr_avoidance.py
 =================
-Synthetic contrail-mitigation simulation framework.
-
-Compares altitude-based contrail avoidance (S1/S2) with SAF-blend strategies
-(S3) against a no-avoidance baseline (S0), using the pycontrails CoCiP model
-over a synthetic Gaussian ISSR.
-
-Workflow
---------
-    sim = ISSRAvoidance()              # default parameters
-    sim.preprocess()                   # build met, generate flight, PS + emissions
-    results = sim.run_strategy("S0")   # baseline CoCiP simulation
-    results = sim.run_strategy("S1")   # altitude-avoidance simulation
-    all_res = sim.run_all_strategies() # all four strategies in one call
-    sim.plot_rhi()                     # visualise the ISSR humidity field
-
-Avoidance strategies
---------------------
-    S0  Baseline  – fly through the ISSR at cruise altitude.
-    S1  Descend   – fly below the ISSR by ``fl_params.fl_alt_delta`` metres.
-    S2  Climb     – fly above the ISSR by ``fl_params.fl_alt_delta`` metres.
-    S3  Combined  – descend (as S1) with a 100 % SAF blend.
+Contrail-mitigation simulation library. Import this; do not run directly.
+Use run_issr.py to configure and execute.
 """
-
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-import matplotlib.pyplot as plt
-from typing import Literal
-from pyproj import Transformer
+import plotly.graph_objects as go
+from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Literal
 
+from pyproj import Transformer
 from pycontrails import Flight, MetDataset
-from pycontrails.core.models import Model
 from pycontrails.core.fuel import SAFBlend
 from pycontrails.models.emissions import Emissions
 from pycontrails.models.ps_model import PSFlight
 from pycontrails.physics import units
 from pycontrails.models.cocip import Cocip
+from pycontrails.models.humidity_scaling import ExponentialBoostHumidityScaling
 
 
 # ---------------------------------------------------------------------------
-# Module-level utilities
+# Utilities
 # ---------------------------------------------------------------------------
 
-def lonlat_to_m(
-    lon: np.ndarray,
-    lat: np.ndarray,
-    ref_lon: float,
-    ref_lat: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert geographic coordinates to local Cartesian metres.
-
-    Uses a Transverse Mercator projection centred on (ref_lon, ref_lat).
-
-    Parameters
-    ----------
-    lon, lat : array-like
-        Geographic coordinates [degrees].
-    ref_lon, ref_lat : float
-        Projection origin [degrees].
-
-    Returns
-    -------
-    x_m, y_m : np.ndarray
-        Easting and northing [m].
-    """
+def lonlat_to_m(lon, lat, ref_lon, ref_lat):
+    """Convert lon/lat [deg] to local Cartesian metres via Transverse Mercator."""
     transformer = Transformer.from_crs(
         "epsg:4326",
-        (
-            f"+proj=tmerc +lat_0={ref_lat} +lon_0={ref_lon}"
-            " +k=1 +x_0=0 +y_0=0"
-        ),
+        f"+proj=tmerc +lat_0={ref_lat} +lon_0={ref_lon} +k=1 +x_0=0 +y_0=0",
         always_xy=True,
     )
-    x_m, y_m = transformer.transform(np.asarray(lon, dtype=float),
-                                     np.asarray(lat, dtype=float))
+    x_m, y_m = transformer.transform(
+        np.asarray(lon, dtype=float), np.asarray(lat, dtype=float)
+    )
     return x_m, y_m
 
 
-def q_sat_ice(T: np.ndarray, p_Pa: np.ndarray) -> np.ndarray:
-    """
-    Saturation specific humidity over ice [kg kg⁻¹].
-
-    Uses the Magnus formula (Alduchov & Eskridge 1996).
-
-    Parameters
-    ----------
-    T : array-like
-        Temperature [K].
-    p_Pa : array-like
-        Pressure [Pa].
-
-    Returns
-    -------
-    np.ndarray
-        Saturation specific humidity [kg kg⁻¹].
-    """
-    eps = 0.6220  # ratio of molar masses H₂O / dry air
-    e_sat = 611.2 * np.exp(22.46 * (T - 273.16) / (T - 0.55))  # [Pa]
+def q_sat_ice(T, p_Pa):
+    """Saturation specific humidity over ice [kg/kg] via Magnus formula."""
+    eps = 0.6220
+    e_sat = 611.2 * np.exp(22.46 * (T - 273.16) / (T - 0.55))
     return eps * e_sat / (p_Pa - e_sat)
+
 
 # ---------------------------------------------------------------------------
 # Parameter dataclasses
@@ -111,185 +54,84 @@ def q_sat_ice(T: np.ndarray, p_Pa: np.ndarray) -> np.ndarray:
 
 @dataclass
 class SimParams:
-    """Simulation grid and temporal parameters."""
-
-    # -- Temporal domain --
-    t_fl: tuple = field(
-        default_factory=lambda: (
-            pd.to_datetime("2025-01-20 13:00:00"),
-            pd.Timedelta(minutes=2),
-            pd.Timedelta(hours=1),
-        )
-    )
-    """(start, dt, duration) for flight waypoint time-stamps."""
-
-    t_con: tuple = field(
-        default_factory=lambda: (
-            pd.to_datetime("2025-01-20 13:00:00"),
-            pd.Timedelta(hours=1),
-            pd.Timedelta(hours=12),
-        )
-    )
-    """(start, dt, duration) for the contrail / met time axis."""
-
-    # -- Spatial domain --
-    lon_bounds: tuple[float, float] = (0.0, 8.0)        # [°] — wide enough for ~10 m/s wind × 12 h advection (~3.9°) plus flight path
-    lat_bounds: tuple[float, float] = (0.0, 2.0)        # [°]
-    alt_bounds: tuple[float, float] = (10000.0, 14000.0)  # [m] — wide enough to cover avoidance strategies (±1500 m from 12 km ISSR)
-    hres_sim: float = 0.25    # horizontal resolution [°]
-    vres_sim: float = 500.0   # vertical resolution [m]
+    """Simulation domain and temporal parameters."""
+    t_start: pd.Timestamp = field(default_factory=lambda: pd.Timestamp("2025-01-20 13:00"))
+    dt_fl: pd.Timedelta = field(default_factory=lambda: pd.Timedelta(minutes=2))
+    duration_fl: pd.Timedelta = field(default_factory=lambda: pd.Timedelta(hours=1))
+    dt_met: pd.Timedelta = field(default_factory=lambda: pd.Timedelta(hours=1))
+    duration_met: pd.Timedelta = field(default_factory=lambda: pd.Timedelta(hours=12))
+    lon_bounds: tuple = (0.0, 8.0)
+    lat_bounds: tuple = (0.0, 2.0)
+    alt_bounds: tuple = (10_000.0, 15_000.0)
+    hres: float = 0.1    # horizontal resolution [deg]
+    vres: float = 100.0  # vertical resolution [m]
 
 
 @dataclass
 class FlParams:
-    """Flight and fuel parameters."""
-
+    """Flight parameters."""
     ac_type: str = "A320"
-    pct_blend: float = 0.0          # SAF blend percentage [0–100]
-    fl_speed: float = 230.0         # cruise true airspeed [m s⁻¹] (informational)
-    fl_target_alt: float | None = None
-    """Cruise altitude [m]. ``None`` → midpoint of ``alt_bounds``."""
-    fl_alt_delta: float = 1500.0    # altitude shift for avoidance strategies [m]
-    fl_lon_bounds: tuple[float, float] = (0.0, 4.0)
-    """Flight longitude range [°]. Narrower than the met domain so advected
-    contrails stay inside the wider met domain throughout the simulation."""
-
-
-@dataclass
-class ContrailParams:
-    """Initial contrail plume parameters (passed to CoCiP where applicable)."""
-
-    depth: float = 50.0    # initial plume depth [m]
-    width: float = 50.0    # initial plume width [m]
-    verbose_outputs: bool = False
+    pct_blend: float = 0.0        # SAF blend [%]
+    target_alt: float = None      # cruise altitude [m]; None -> domain midpoint
+    alt_delta: float = 1000.0     # altitude shift for S1/S2 [m]
+    fl_lon_bounds: tuple = (0.0, 4.0)
+    rocd: float = 5.0             # rate of climb/descent [m/s]
+    avoid_frac: float = 1.0       # fraction of ISSR Gaussian to avoid [0-1]
+    cruise_mach: float = 0.78     # cruise Mach number passed to PSFlight
 
 
 @dataclass
 class MetParams:
     """Uniform background atmospheric state."""
-
-    air_temperature: float = 220.0                    # [K]
-    eastward_wind: float = 0.0                       # [m s⁻¹]
-    northward_wind: float = 0.0                       # [m s⁻¹]
-    lagrangian_tendency_of_air_pressure: float = 0.0  # [Pa s⁻¹]
+    air_temperature: float = 220.0
+    eastward_wind: float = 0.0
+    northward_wind: float = 0.0
+    lagrangian_tendency_of_air_pressure: float = 0.0
 
 
 @dataclass
 class ISSRParams:
+    """Gaussian ISSR parameters."""
+    centroid: tuple = (2.0, 1.0, 12_000.0)  # (lon deg, lat deg, alt m)
+    sigma_parallel: float = 150_000.0        # along-track half-width [m]
+    sigma_perp: float = 50_000.0             # across-track half-width [m]
+    sigma_z: float = 500.0                   # vertical half-width [m]
+    rhi_bg: float = 0.75    # background RHi
+    rhi_peak: float = 1.20  # peak RHi at centroid
+
+# ---------------------------------------------------------------------------
+# Main simulation class
+# ---------------------------------------------------------------------------
+
+class ContrailSimulator:
     """
-    Gaussian ISSR representation.
+    Contrail-mitigation simulation over a synthetic Gaussian ISSR.
 
-    The ISSR is modelled as a smooth perturbation of specific humidity:
-
-        q = q_bg + Δq · M(lon, lat, alt)
-
-    where M is a trivariate Gaussian centred on ``issr_centroid`` with
-    independent half-widths ``sigma_parallel`` (along-track / longitude),
-    ``sigma_perp`` (across-track / latitude), and ``sigma_z`` (vertical).
-    Background RHi = ``rhi_bg``; peak RHi at centroid = ``rhi_peak``.
-    """
-
-    issr_centroid: tuple[float, float, float] = (2.0, 1.0, 12000.0)
-    """(lon [°], lat [°], alt [m]) of the ISSR peak. Placed in western half so the contrail advects through it."""
-
-    sigma_parallel: float = 150_000.0   # along-track (longitude) half-width [m]
-    sigma_perp: float = 50_000.0        # across-track (latitude) half-width [m]
-    sigma_z: float = 500.0              # vertical half-width [m]
-
-    rhi_bg: float = 0.75    # background RHi outside the ISSR [–]
-    rhi_peak: float = 1.20  # peak RHi at ISSR centroid [–]
-
-
-class ISSRAvoidance(Model):
-    """
-    Synthetic contrail-mitigation simulation framework.
-
-    Generates a straight east-west flight through (or around) a synthetic
-    Gaussian ISSR and evaluates contrail climate impact using CoCiP across
-    four avoidance strategies.
-
-    Parameters
-    ----------
-    sim_params : SimParams, optional
-    fl_params : FlParams, optional
-    contrail_params : ContrailParams, optional
-    met_params : MetParams, optional
-    issr_params : ISSRParams, optional
-
-    Examples
-    --------
-    >>> sim = ISSRAvoidance()
-    >>> sim.preprocess()
-    >>> results = sim.run_all_strategies()
-    >>> df = sim.compare_strategies(results)
+    Instantiate with parameter dataclasses, then call run_all_strategies()
+    or run_strategy() directly.
     """
 
-    name = "ISSRAvoidance"
-    long_name = "ISSR Contrail Avoidance Simulation Framework"
-
-    def __init__(
-        self,
-        sim_params: SimParams | None = None,
-        fl_params: FlParams | None = None,
-        contrail_params: ContrailParams | None = None,
-        met_params: MetParams | None = None,
-        issr_params: ISSRParams | None = None,
-    ) -> None:
-        super().__init__()
-
+    def __init__(self, sim_params=None, fl_params=None, met_params=None, issr_params=None):
         self.sim_params = sim_params or SimParams()
         self.fl_params = fl_params or FlParams()
-        self.contrail_params = contrail_params or ContrailParams()
         self.met_params = met_params or MetParams()
         self.issr_params = issr_params or ISSRParams()
+        self.build_grid()
 
-        self._build_grid(self.sim_params)
-
+    def build_grid(self):
         sp = self.sim_params
-        self.times_fl = pd.date_range(
-            start=sp.t_fl[0],
-            end=sp.t_fl[0] + sp.t_fl[2],
-            freq=sp.t_fl[1],
-        )
-        self.times_con = pd.date_range(
-            start=sp.t_con[0],
-            end=sp.t_con[0] + sp.t_con[2],
-            freq=sp.t_con[1],
-        )
+        h, v, eps = sp.hres, sp.vres, 1e-9
 
-        # Populated by preprocess()
-        self.fl: Flight | None = None
-        self.met: MetDataset | None = None
-        self.rad: MetDataset | None = None
-
-    # ------------------------------------------------------------------
-    # Grid construction
-    # ------------------------------------------------------------------
-
-    def _build_grid(self, sp: SimParams) -> None:
-        """Construct domain and padded met grid arrays from *sp*."""
-        h = sp.hres_sim
-        v = sp.vres_sim
-        eps = 1e-9  # ensures np.arange includes the upper endpoint
-
-        # -- Core domain grid (cell centres) --
         self.lons = np.arange(sp.lon_bounds[0] + h / 2, sp.lon_bounds[1] + eps, h)
         self.lats = np.arange(sp.lat_bounds[0] + h / 2, sp.lat_bounds[1] + eps, h)
         self.alts = np.arange(sp.alt_bounds[0] + v / 2, sp.alt_bounds[1] + eps, v)
-        self.levels = units.m_to_pl(self.alts)
 
-        # -- Padded met grid: one extra cell on each side for interpolation --
-        self.met_lons = np.arange(sp.lon_bounds[0] - h / 2,
-                                  sp.lon_bounds[1] + h + eps, h)
-        self.met_lats = np.arange(sp.lat_bounds[0] - h / 2,
-                                  sp.lat_bounds[1] + h + eps, h)
-        self.met_alts = np.arange(sp.alt_bounds[0] - v / 2,
-                                  sp.alt_bounds[1] + v + eps, v)
-        self.met_levels = units.m_to_pl(self.met_alts)  # hPa, descending order
+        self.met_lons = np.arange(sp.lon_bounds[0] - h / 2, sp.lon_bounds[1] + h + eps, h)
+        self.met_lats = np.arange(sp.lat_bounds[0] - h / 2, sp.lat_bounds[1] + h + eps, h)
+        self.met_alts = np.arange(sp.alt_bounds[0] - v / 2, sp.alt_bounds[1] + v + eps, v)
+        self.met_levels = units.m_to_pl(self.met_alts)
 
-        # -- Local Cartesian axes [m] for Gaussian ISSR computation --
-        ref_lon = float(sp.lon_bounds[0])
-        ref_lat = float(sp.lat_bounds[0])
+        ref_lon, ref_lat = sp.lon_bounds[0], sp.lat_bounds[0]
         self.met_lons_m, _ = lonlat_to_m(
             self.met_lons, np.full_like(self.met_lons, ref_lat), ref_lon, ref_lat
         )
@@ -297,730 +139,352 @@ class ISSRAvoidance(Model):
             np.full_like(self.met_lats, ref_lon), self.met_lats, ref_lon, ref_lat
         )
 
-    # ------------------------------------------------------------------
-    # ISSR field generation
-    # ------------------------------------------------------------------
-
-    def _gen_issr_field(self) -> np.ndarray:
-        """
-        Build a 4-D specific-humidity array embedding a Gaussian ISSR.
-
-        Background RHi = ``issr_params.rhi_bg``; peak RHi at the centroid
-        = ``issr_params.rhi_peak``. The field is uniform in time.
-
-        Returns
-        -------
-        np.ndarray
-            Shape ``(n_lon, n_lat, n_level, n_time)`` [kg kg⁻¹].
-        """
-        issr = self.issr_params
-        T = self.met_params.air_temperature
-
-        # Saturation specific humidity at each pressure level [kg kg⁻¹]
-        p_Pa = self.met_levels * 100.0          # hPa → Pa, shape (n_level,)
-        qs = q_sat_ice(T, p_Pa)                  # shape (n_level,)
-
-        # ISSR centroid in local Cartesian metres
-        ref_lon = float(self.sim_params.lon_bounds[0])
-        ref_lat = float(self.sim_params.lat_bounds[0])
-        cx, cy = lonlat_to_m(
-            np.array([issr.issr_centroid[0]]),
-            np.array([issr.issr_centroid[1]]),
-            ref_lon, ref_lat,
+        self.times_fl = pd.date_range(
+            start=sp.t_start, end=sp.t_start + sp.duration_fl, freq=sp.dt_fl
         )
-        cx, cy = float(cx[0]), float(cy[0])
-        cz = issr.issr_centroid[2]              # altitude [m]
+        self.times_met = pd.date_range(
+            start=sp.t_start, end=sp.t_start + sp.duration_met, freq=sp.dt_met
+        )
 
-        # Displacement arrays with broadcasting shapes:
-        # (n_lon, 1, 1), (1, n_lat, 1), (1, 1, n_level)
+
+    def _rhi_field(self):
+        """Gaussian RHi field. Returns shape (n_lon, n_lat, n_level)."""
+        ip = self.issr_params
+        ref_lon, ref_lat = self.sim_params.lon_bounds[0], self.sim_params.lat_bounds[0]
+        cx, cy = lonlat_to_m(
+            np.array([ip.centroid[0]]), np.array([ip.centroid[1]]), ref_lon, ref_lat
+        )
+        cx, cy, cz = float(cx[0]), float(cy[0]), ip.centroid[2]
+
         dx = self.met_lons_m[:, None, None] - cx
         dy = self.met_lats_m[None, :, None] - cy
         dz = self.met_alts[None, None, :] - cz
 
         M = np.exp(
-            -(dx ** 2) / (2.0 * issr.sigma_parallel ** 2)
-            - (dy ** 2) / (2.0 * issr.sigma_perp ** 2)
-            - (dz ** 2) / (2.0 * issr.sigma_z ** 2)
-        )  # shape (n_lon, n_lat, n_level)
-
-        # q = q_background + Δq · Gaussian mask
-        q_bg = issr.rhi_bg * qs                  # (n_level,)
-        dq = (issr.rhi_peak - issr.rhi_bg) * qs  # (n_level,)
-        q_3d = q_bg[None, None, :] + dq[None, None, :] * M
-        q_3d = np.clip(q_3d, 1e-9, None)
-
-        # Broadcast over time → (n_lon, n_lat, n_level, n_time)
-        n_time = len(self.times_con)
-        return np.broadcast_to(q_3d[..., None], q_3d.shape + (n_time,)).copy()
-
-    # ------------------------------------------------------------------
-    # Trajectory generation
-    # ------------------------------------------------------------------
-
-    def traj_gen(self, alt: float | None = None) -> Flight:
-        """
-        Generate a straight east-west flight trajectory.
-
-        Waypoints are evenly spaced in longitude from ``lon_bounds[0]`` to
-        ``lon_bounds[1]`` at the latitude midpoint of the domain.
-
-        Parameters
-        ----------
-        alt : float, optional
-            Cruise altitude [m]. Defaults to ``fl_params.fl_target_alt``
-            or the midpoint of ``sim_params.alt_bounds``.
-
-        Returns
-        -------
-        Flight
-        """
-        sp = self.sim_params
-        fp = self.fl_params
-
-        if alt is None:
-            alt = fp.fl_target_alt
-        if alt is None:
-            alt = 0.5 * (sp.alt_bounds[0] + sp.alt_bounds[1])
-
-        lat_mid = 0.5 * (sp.lat_bounds[0] + sp.lat_bounds[1])
-        n_wp = len(self.times_fl)
-
-        df = pd.DataFrame(
-            {
-                "longitude": np.linspace(fp.fl_lon_bounds[0], fp.fl_lon_bounds[1], n_wp),
-                "latitude": np.full(n_wp, lat_mid),
-                "altitude": np.full(n_wp, float(alt)),
-                "time": self.times_fl,
-            }
+            -(dx ** 2) / (2 * ip.sigma_parallel ** 2)
+            - (dy ** 2) / (2 * ip.sigma_perp ** 2)
+            - (dz ** 2) / (2 * ip.sigma_z ** 2)
         )
+        return ip.rhi_bg + (ip.rhi_peak - ip.rhi_bg) * M
 
-        return Flight(
-            data=df,
-            attrs={"aircraft_type": fp.ac_type, "flight_id": "synthetic_fl_001"},
-            fuel=SAFBlend(fp.pct_blend),
-        )
+    def _q_field(self):
+        """RHi -> specific humidity, broadcast over time."""
+        T = self.met_params.air_temperature
+        qs = q_sat_ice(T, self.met_levels * 100.0)
+        rhi = self._rhi_field()
+        q_3d = np.clip(rhi * qs[None, None, :], 1e-9, None)
+        n_t = len(self.times_met)
+        return np.broadcast_to(q_3d[..., None], q_3d.shape + (n_t,)).copy()
 
-    # ------------------------------------------------------------------
-    # Meteorological data generation
-    # ------------------------------------------------------------------
-
-    def gen_met(self) -> tuple[MetDataset, MetDataset]:
+    def gen_met(self):
         """
-        Generate synthetic pressure-level and radiation MetDatasets.
+        Build synthetic meteorology and radiation datasets.
 
-        The ISSR is embedded as a Gaussian ``specific_humidity`` perturbation
-        over a horizontally and temporally uniform background atmosphere.
-
-        Radiation uses a nighttime proxy (solar = 0 W m⁻²; representative OLR
-        values). For accurate RF calculations substitute real ERA5 radiation.
-
-        Returns
-        -------
-        met : MetDataset
-            Pressure-level variables required by CoCiP.
-        rad : MetDataset
-            Single-level radiation variables required by CoCiP.
+        Pressure-level met uses the Gaussian ISSR humidity field over a
+        uniform background atmosphere from MetParams.  Radiation is set to
+        a typical nighttime scenario (no solar, standard OLR).
+        No ERA5 download or cache required.
         """
         mp = self.met_params
-        n_lo = len(self.met_lons)
-        n_la = len(self.met_lats)
-        n_lv = len(self.met_levels)
-        n_t = len(self.times_con)
-        shape4 = (n_lo, n_la, n_lv, n_t)
-        shape3 = (n_lo, n_la, n_t)
-        times = self.times_con.values
 
-        q_4d = self._gen_issr_field()
+        lons   = self.met_lons.astype("float32")
+        lats   = self.met_lats.astype("float32")
+        levels = self.met_levels.astype("float32")   # hPa
+        times  = self.times_met
+
+        n_lon, n_lat, n_lev, n_t = len(lons), len(lats), len(levels), len(times)
+        shape4 = (n_lon, n_lat, n_lev, n_t)
+        ones   = np.ones(shape4, dtype="float32")
+        dims4  = ["longitude", "latitude", "level", "time"]
+        coords4 = dict(longitude=lons, latitude=lats, level=levels, time=times)
 
         ds = xr.Dataset(
             {
                 "air_temperature": (
-                    ["longitude", "latitude", "level", "time"],
-                    np.full(shape4, mp.air_temperature),
-                ),
+                    dims4, ones * np.float32(mp.air_temperature)),
                 "specific_humidity": (
-                    ["longitude", "latitude", "level", "time"],
-                    q_4d,
-                ),
+                    dims4, self._q_field().astype("float32")),
                 "eastward_wind": (
-                    ["longitude", "latitude", "level", "time"],
-                    np.full(shape4, mp.eastward_wind),
-                ),
+                    dims4, ones * np.float32(mp.eastward_wind)),
                 "northward_wind": (
-                    ["longitude", "latitude", "level", "time"],
-                    np.full(shape4, mp.northward_wind),
-                ),
+                    dims4, ones * np.float32(mp.northward_wind)),
                 "lagrangian_tendency_of_air_pressure": (
-                    ["longitude", "latitude", "level", "time"],
-                    np.full(shape4, mp.lagrangian_tendency_of_air_pressure),
-                ),
-                # Clear-sky synthetic atmosphere: no cirrus cloud
+                    dims4, ones * np.float32(mp.lagrangian_tendency_of_air_pressure)),
                 "tau_cirrus": (
-                    ["longitude", "latitude", "level", "time"],
-                    np.zeros(shape4),
-                ),
+                    dims4, np.zeros(shape4, dtype="float32")),
             },
-            coords={
-                "longitude": self.met_lons,
-                "latitude": self.met_lats,
-                "level": self.met_levels,   # hPa, descending order
-                "time": times,
-            },
+            coords=coords4,
         )
         met = MetDataset(ds)
 
-        # Nighttime radiation proxy: solar = 0, representative OLR values.
-        # Units are set to "W m**-2" so CoCiP skips the J/m² accumulation
-        # conversion and uses the values directly as instantaneous fluxes.
-        # The dataset-level attrs mimic ERA5 reanalysis metadata so that
-        # pycontrails uses the correct variable names (top_net_*_radiation).
-        rad_vars = {
-            "top_net_thermal_radiation": -200.0,   # W m⁻² (negative = upward)
-            "top_net_solar_radiation": 0.0,        # nighttime → no solar
-            "surface_net_thermal_radiation": -50.0,
-            "surface_net_solar_radiation": 0.0,
-        }
+        # Radiation (single-level) — nighttime: solar = 0, standard OLR
+        shape3  = (n_lon, n_lat, n_t)
+        dims3   = ["longitude", "latitude", "time"]
+        coords3 = dict(longitude=lons, latitude=lats, time=times)
+
         ds_rad = xr.Dataset(
             {
-                name: xr.DataArray(
-                    np.full(shape3, value, dtype=np.float32),
-                    dims=["longitude", "latitude", "time"],
-                    attrs={"units": "W m**-2"},
-                )
-                for name, value in rad_vars.items()
+                "top_net_solar_radiation": xr.DataArray(
+                    np.zeros(shape3, dtype="float32"),
+                    dims=dims3,
+                    attrs={"units": "J m**-2"},
+                ),
+                "top_net_thermal_radiation": xr.DataArray(
+                    np.full(shape3, -8.64e5, dtype="float32"),
+                    dims=dims3,
+                    attrs={"units": "J m**-2"},
+                ),
             },
-            coords={
-                "longitude": self.met_lons,
-                "latitude": self.met_lats,
-                "time": times,
-            },
-            attrs={
-                "provider": "ECMWF",
-                "dataset": "ERA5",
-                "product": "reanalysis",
-            },
-        )
-        rad = MetDataset(ds_rad.expand_dims({"level": [-1]}))
+            coords=coords3,
+            attrs={"provider": "ECMWF", "dataset": "ERA5", "product": "reanalysis"},
+        ).expand_dims({"level": [-1]})
+        rad = MetDataset(ds_rad)
 
         return met, rad
 
-    # ------------------------------------------------------------------
-    # Aircraft performance and emissions
-    # ------------------------------------------------------------------
-
-    def ac_perf(self, fl: Flight, met: MetDataset | None = None) -> Flight:
+    def gen_flight(self, alt=None, alt_target=None, direction=0, avoid_frac=None, pct_blend=None):
         """
-        Compute aircraft performance with the Poll-Schumann (PS) model.
+        Generate a flight trajectory with optional ISSR avoidance.
 
-        Parameters
-        ----------
-        fl : Flight
-        met : MetDataset, optional
-            Without met the PS model falls back to the International Standard
-            Atmosphere.
-
-        Returns
-        -------
-        Flight
-            With additional columns: ``fuel_flow``, ``thrust``,
-            ``engine_efficiency``, ``true_airspeed``, etc.
-        """
-        return PSFlight(met=met).eval(fl)
-
-    def emissions(self, fl: Flight, met: MetDataset | None = None) -> Flight:
-        """
-        Estimate aircraft emissions with the Pycontrails Emissions model.
-
-        Parameters
-        ----------
-        fl : Flight
-            Must contain PS model output columns.
-        met : MetDataset, optional
-
-        Returns
-        -------
-        Flight
-            With additional columns: ``nvpm_ei_n``, ``nox_ei``, etc.
-        """
-        return Emissions(met=met).eval(fl)
-
-    # ------------------------------------------------------------------
-    # SAF assignment
-    # ------------------------------------------------------------------
-
-    def assign_saf(self, fl: Flight, pct_blend: float) -> Flight:
-        """
-        Return a copy of *fl* with a new SAF blend percentage applied.
-
-        Parameters
-        ----------
-        fl : Flight
-        pct_blend : float
-            SAF blend ratio [%, 0–100].
-
-        Returns
-        -------
-        Flight
-        """
-        fl_saf = fl.copy()
-        fl_saf.fuel = SAFBlend(pct_blend)
-        return fl_saf
-
-    # ------------------------------------------------------------------
-    # CoCiP
-    # ------------------------------------------------------------------
-
-    def run_cocip(
-        self,
-        fl: Flight,
-        met: MetDataset,
-        rad: MetDataset,
-        **cocip_kwargs,
-    ) -> tuple[Flight, pd.DataFrame | None]:
-        """
-        Run the CoCiP contrail lifecycle model.
-
-        Parameters
-        ----------
-        fl : Flight
-            Must contain aircraft-performance and emissions columns.
-        met : MetDataset
-            Pressure-level met (from :meth:`gen_met`).
-        rad : MetDataset
-            Radiation met (from :meth:`gen_met`).
-        **cocip_kwargs
-            Additional keyword arguments forwarded to :class:`Cocip`.
-
-        Returns
-        -------
-        fl_out : Flight
-            Flight with CoCiP persistent-contrail flags.
-        contrail : pd.DataFrame or None
-            Lagrangian contrail segments; ``None`` if no persistent contrails
-            formed.
-        """
-        cocip = Cocip(
-            met=met,
-            rad=rad,
-            dt_integration=np.timedelta64(1, "h"),  # match 1-hour met time step
-            max_age=self.sim_params.t_con[2],        # stop tracking at end of met domain
-            **cocip_kwargs,
-        )
-        fl_out = cocip.eval(fl)
-        return fl_out, cocip.contrail
-
-    # ------------------------------------------------------------------
-    # Strategy runner
-    # ------------------------------------------------------------------
-
-    def run_strategy(
-        self,
-        strategy: Literal["S0", "S1", "S2", "S3"],
-        met: MetDataset | None = None,
-        rad: MetDataset | None = None,
-        **cocip_kwargs,
-    ) -> dict:
-        """
-        Run a complete simulation for one named avoidance strategy.
-
-        ====  ============================================================
-        S0    Baseline  – fly through ISSR at cruise altitude.
-        S1    Descend   – fly ``fl_alt_delta`` m below the ISSR centroid.
-        S2    Climb     – fly ``fl_alt_delta`` m above the ISSR centroid.
-        S3    Combined  – descend (as S1) with a 100 % SAF blend.
-        ====  ============================================================
-
-        Parameters
-        ----------
-        strategy : {"S0", "S1", "S2", "S3"}
-        met, rad : MetDataset, optional
-            Pre-computed datasets; generated fresh if not supplied.
-        **cocip_kwargs
-            Forwarded to :class:`Cocip`.
-
-        Returns
-        -------
-        dict
-            Keys: ``strategy``, ``altitude``, ``pct_blend``, ``ef``,
-            ``rf_lw_mean``, ``fuel_burn_mean``, ``fl``, ``contrail``.
-        """
-        fp = self.fl_params
-        issr = self.issr_params
-
-        alt_cruise = fp.fl_target_alt or 0.5 * (
-            self.sim_params.alt_bounds[0] + self.sim_params.alt_bounds[1]
-        )
-
-        strategy_map: dict[str, tuple[float, float]] = {
-            "S0": (alt_cruise,
-                   fp.pct_blend),
-            "S1": (issr.issr_centroid[2] - fp.fl_alt_delta,
-                   fp.pct_blend),
-            "S2": (issr.issr_centroid[2] + fp.fl_alt_delta,
-                   fp.pct_blend),
-            "S3": (issr.issr_centroid[2] - fp.fl_alt_delta,
-                   100.0),
-        }
-        if strategy not in strategy_map:
-            raise ValueError(
-                f"Unknown strategy {strategy!r}. Choose from {list(strategy_map)}."
-            )
-        alt, pct_blend = strategy_map[strategy]
-
-        if met is None or rad is None:
-            met, rad = self.gen_met()
-
-        fl = self.traj_gen(alt=alt)
-        if pct_blend != fp.pct_blend:
-            fl = self.assign_saf(fl, pct_blend)
-
-        fl = self.ac_perf(fl, met)
-        fl = self.emissions(fl, met)
-        fl_out, contrail = self.run_cocip(fl, met, rad, **cocip_kwargs)
-
-        ef = (
-            float(contrail["ef"].sum())
-            if contrail is not None and "ef" in contrail.columns
-            else 0.0
-        )
-        rf_lw = (
-            float(contrail["rf_lw"].mean())
-            if contrail is not None and "rf_lw" in contrail.columns
-            else 0.0
-        )
-        fuel_burn = (
-            float(fl_out.dataframe["fuel_flow"].mean())
-            if "fuel_flow" in fl_out.dataframe.columns
-            else None
-        )
-
-        return {
-            "strategy": strategy,
-            "altitude": alt,
-            "pct_blend": pct_blend,
-            "ef": ef,
-            "rf_lw_mean": rf_lw,
-            "fuel_burn_mean": fuel_burn,
-            "fl": fl_out,
-            "contrail": contrail,
-        }
-
-    def run_all_strategies(self, **cocip_kwargs) -> dict[str, dict]:
-        """
-        Run all four strategies in sequence, sharing one met/rad dataset.
-
-        Parameters
-        ----------
-        **cocip_kwargs
-            Forwarded to :class:`Cocip` for every strategy.
-
-        Returns
-        -------
-        dict mapping strategy name → results dict (see :meth:`run_strategy`).
-        """
-        met, rad = self.gen_met()
-        results: dict[str, dict] = {}
-        for s in ("S0", "S1", "S2", "S3"):
-            print(f"Running strategy {s} …")
-            results[s] = self.run_strategy(s, met=met, rad=rad, **cocip_kwargs)
-        return results
-
-    def compare_strategies(
-        self,
-        results: dict[str, dict] | None = None,
-        **cocip_kwargs,
-    ) -> pd.DataFrame:
-        """
-        Tabulate a summary DataFrame for all four strategies.
-
-        Parameters
-        ----------
-        results : dict, optional
-            Output of :meth:`run_all_strategies`. Computed fresh if not given.
-        **cocip_kwargs
-            Forwarded to :meth:`run_all_strategies` if *results* is ``None``.
-
-        Returns
-        -------
-        pd.DataFrame
-            Indexed by strategy name.
-        """
-        if results is None:
-            results = self.run_all_strategies(**cocip_kwargs)
-
-        rows = [
-            {
-                "Strategy": s,
-                "Altitude [m]": r["altitude"],
-                "SAF blend [%]": r["pct_blend"],
-                "Total EF [J]": r["ef"],
-                "Mean LW RF [W m⁻²]": r["rf_lw_mean"],
-                "Mean fuel flow [kg s⁻¹]": r["fuel_burn_mean"],
-            }
-            for s, r in results.items()
-        ]
-        return pd.DataFrame(rows).set_index("Strategy")
-
-    # ------------------------------------------------------------------
-    # Preprocessing
-    # ------------------------------------------------------------------
-
-    def preprocess(self) -> None:
-        """
-        Run the full preprocessing pipeline and cache outputs as attributes.
-
-        Steps
-        -----
-        1. Generate the synthetic met and radiation datasets.
-        2. Generate the baseline (S0) flight trajectory.
-        3. Compute aircraft performance using the PS model.
-        4. Estimate emissions.
-
-        Outputs stored as ``self.fl``, ``self.met``, ``self.rad``.
-        """
-        print("Generating synthetic met/rad …")
-        self.met, self.rad = self.gen_met()
-
-        print("Generating flight trajectory …")
-        fl = self.traj_gen()
-
-        print("Running PS aircraft-performance model …")
-        fl = self.ac_perf(fl, self.met)
-
-        print("Estimating emissions …")
-        fl = self.emissions(fl, self.met)
-
-        self.fl = fl
-        print(
-            "Preprocessing complete.\n"
-            f"  Waypoints  : {len(fl)}\n"
-            f"  Altitude   : {fl.dataframe['altitude'].iloc[0]:.0f} m\n"
-            f"  Met domain : "
-            f"lon=[{self.met_lons[0]:.2f}, {self.met_lons[-1]:.2f}] "
-            f"lat=[{self.met_lats[0]:.2f}, {self.met_lats[-1]:.2f}] "
-            f"lev=[{self.met_levels[-1]:.0f}, {self.met_levels[0]:.0f}] hPa"
-        )
-
-    # ------------------------------------------------------------------
-    # Required Model.eval() implementation
-    # ------------------------------------------------------------------
-
-    def eval(self, source: Flight | None = None, **params) -> dict[str, dict]:
-        """
-        Evaluate all four avoidance strategies.
-
-        Satisfies the pycontrails :class:`Model` abstract interface.
-        Equivalent to calling :meth:`run_all_strategies`.
-
-        Parameters
-        ----------
-        source : Flight, optional
-            Ignored; trajectories are generated internally.
-        **params
-            Forwarded to :meth:`run_all_strategies`.
-
-        Returns
-        -------
-        dict mapping strategy name → results dict.
-        """
-        return self.run_all_strategies(**params)
-
-    # ------------------------------------------------------------------
-    # Visualisation helpers
-    # ------------------------------------------------------------------
-
-    def plot_rhi(
-        self,
-        alt: float | None = None,
-        time_idx: int = 0,
-        ax: plt.Axes | None = None,
-    ) -> plt.Axes:
-        """
-        Plot a horizontal RHi map at a given altitude and time index.
-
-        The ISSR boundary (RHi = 1) is drawn as a dashed black contour.
+        All strategies share the same baseline longitude/latitude path.
+        For avoidance (direction != 0), the aircraft climbs or descends at
+        *rocd* [m/s] starting at a diversion point set by *avoid_frac*,
+        levels off at *alt_target*, then returns symmetrically after the ISSR.
 
         Parameters
         ----------
         alt : float, optional
-            Altitude slice [m]. Defaults to the ISSR centroid altitude.
-        time_idx : int
-            Index into ``self.times_con``.
-        ax : matplotlib.axes.Axes, optional
-
-        Returns
-        -------
-        matplotlib.axes.Axes
+            Baseline cruise altitude [m].
+        alt_target : float, optional
+            Target altitude during avoidance [m]. Ignored when direction=0.
+        direction : int
+            +1 = climb, -1 = descend, 0 = straight (no deviation).
+        avoid_frac : float, optional
+            Fraction of the Gaussian to avoid [0-1].
+            0 = no diversion; 1 = avoid entire sigma region.
+            Defaults to fl_params.avoid_frac.
+        pct_blend : float, optional
+            SAF blend [%]. Defaults to fl_params.pct_blend.
         """
+        sim_params, fl_params, issr_params = self.sim_params, self.fl_params, self.issr_params
+
         if alt is None:
-            alt = self.issr_params.issr_centroid[2]
+            alt = fl_params.target_alt or 0.5 * (sim_params.alt_bounds[0] + sim_params.alt_bounds[1])
+        if pct_blend is None:
+            pct_blend = fl_params.pct_blend
+        if avoid_frac is None:
+            avoid_frac = fl_params.avoid_frac
 
-        T = self.met_params.air_temperature
-        alt_idx = int(np.argmin(np.abs(self.met_alts - alt)))
-        p_Pa = self.met_levels[alt_idx] * 100.0
-        qs = q_sat_ice(T, p_Pa)
+        n_wp = len(self.times_fl)
+        lat_mid = 0.5 * (sim_params.lat_bounds[0] + sim_params.lat_bounds[1])
+        lons = np.linspace(fl_params.fl_lon_bounds[0], fl_params.fl_lon_bounds[1], n_wp)
+        alts = np.full(n_wp, float(alt))
 
-        q_4d = self._gen_issr_field()
-        rhi = q_4d[:, :, alt_idx, time_idx] / qs   # (n_lon, n_lat)
+        # Avoidance logic: climb or descend to alt_target, then return to baseline.
+        if direction != 0 and alt_target is not None and avoid_frac > 0:
+            cx_lon = issr_params.centroid[0]
+            m_per_deg = 111_319.0 * np.cos(np.deg2rad(lat_mid))
 
-        if ax is None:
-            _, ax = plt.subplots(figsize=(9, 4))
+            # Distance from centroid at which diversion begins.
+            # avoid_frac=1 -> divert starting 1-sigma out; avoid_frac=0 -> no margin
+            x_div_m = issr_params.sigma_parallel * avoid_frac
+            x_div_deg = x_div_m / m_per_deg
 
-        cf = ax.contourf(
-            self.met_lons, self.met_lats, rhi.T,
-            levels=np.linspace(0.5, 1.5, 21),
-            cmap="RdBu_r", extend="both",
+            # Ground speed from waypoint spacing and time step
+            dt_s = (self.times_fl[1] - self.times_fl[0]).total_seconds()
+            dlon = (fl_params.fl_lon_bounds[1] - fl_params.fl_lon_bounds[0]) / (n_wp - 1)
+            v_gnd = dlon * m_per_deg / dt_s  # m/s
+
+            # Climb/descent distance needed to reach alt_target
+            dx_trans_deg = abs(alt_target - alt) / fl_params.rocd * v_gnd / m_per_deg
+
+            # Four transition longitudes
+            lon_start  = cx_lon - x_div_deg - dx_trans_deg  # begin climb/descend
+            lon_level  = cx_lon - x_div_deg                 # reached alt_target
+            lon_resume = cx_lon + x_div_deg                 # begin return
+            lon_end    = cx_lon + x_div_deg + dx_trans_deg  # back to baseline
+
+            for i, lon in enumerate(lons):
+                if lon <= lon_start:
+                    alts[i] = alt
+                elif lon < lon_level:
+                    frac = (lon - lon_start) / (lon_level - lon_start)
+                    alts[i] = alt + frac * (alt_target - alt)
+                elif lon <= lon_resume:
+                    alts[i] = alt_target
+                elif lon < lon_end:
+                    frac = (lon - lon_resume) / (lon_end - lon_resume)
+                    alts[i] = alt_target + frac * (alt - alt_target)
+                else:
+                    alts[i] = alt
+
+        df = pd.DataFrame({
+            "longitude": lons,
+            "latitude": np.full(n_wp, lat_mid),
+            "altitude": alts,
+            "time": self.times_fl,
+            "mach_number": np.full(n_wp, fl_params.cruise_mach),
+        })
+        return Flight(
+            data=df,
+            attrs={"aircraft_type": fl_params.ac_type, "flight_id": "synthetic_fl_001"},
+            fuel=SAFBlend(pct_blend),
         )
-        ax.contour(
-            self.met_lons, self.met_lats, rhi.T,
-            levels=[1.0], colors="k", linewidths=1.5, linestyles="--",
+
+    def run_cocip(self, fl, met=None, rad=None, **cocip_kwargs):
+        """Run CoCiP on a Flight object, returning the updated Flight and contrail DataFrame."""
+        if met is None or rad is None:
+            met, rad = self.gen_met()
+
+        humidity_scaling = ExponentialBoostHumidityScaling()
+
+        fl = PSFlight(met=met).eval(fl)
+        fl = Emissions(met=met, humidity_scaling=humidity_scaling).eval(fl)
+
+        # max_age must not push contrail time past the end of the met data.
+        # The last flight waypoint is at t_start + duration_fl, so the
+        # furthest any contrail can run is duration_met - duration_fl.
+        max_age = self.sim_params.duration_met - self.sim_params.duration_fl
+
+        cocip = Cocip(
+            met=met, rad=rad,
+            dt_integration=np.timedelta64(10, "m"),
+            max_age=max_age,
+            humidity_scaling=humidity_scaling,
+            **cocip_kwargs,
         )
-        plt.colorbar(cf, ax=ax, label="RHi [–]")
-        ax.set_xlabel("Longitude [°]")
-        ax.set_ylabel("Latitude [°]")
-        ax.set_title(
-            f"RHi at {alt / 1e3:.1f} km ({self.met_levels[alt_idx]:.0f} hPa)"
-            f"  |  t = {self.times_con[time_idx]}"
-        )
-        return ax
-
-    def plot_rhi_vertical(
-        self,
-        lon: float | None = None,
-        time_idx: int = 0,
-        ax: plt.Axes | None = None,
-    ) -> plt.Axes:
+        fl_out = cocip.eval(fl)
+        contrail = cocip.contrail
+        return fl_out, contrail
+    
+    def run_flights(self, flight_cases: pd.DataFrame, **cocip_kwargs):
         """
-        Plot an altitude profile of RHi at the ISSR centroid longitude.
+        Run every row in flight_cases as one independent flight case.
 
-        Parameters
-        ----------
-        lon : float, optional
-            Longitude [°]. Defaults to the ISSR centroid longitude.
-        time_idx : int
-            Index into ``self.times_con``.
-        ax : matplotlib.axes.Axes, optional
-
-        Returns
-        -------
-        matplotlib.axes.Axes
+        Expected columns:
+            case
+            alt
+            alt_target
+            avoidance
+            pct_blend
         """
-        if lon is None:
-            lon = self.issr_params.issr_centroid[0]
+        required = {"case", "alt", "alt_target", "avoidance", "pct_blend"}
+        missing = required - set(flight_cases.columns)
 
-        T = self.met_params.air_temperature
-        p_Pa = self.met_levels * 100.0
-        qs = q_sat_ice(T, p_Pa)
+        if missing:
+            raise ValueError(f"flight_cases is missing required columns: {missing}")
+        
+        allowed = {"none", "descend", "climb"}
+        bad = set(flight_cases["avoidance"]) - allowed
 
-        lon_idx = int(np.argmin(np.abs(self.met_lons - lon)))
-        lat_mid = len(self.met_lats) // 2
+        if bad:
+            raise ValueError(f"Invalid avoidance values: {bad}. Use one of {allowed}.")
 
-        q_4d = self._gen_issr_field()
-        rhi = q_4d[lon_idx, lat_mid, :, time_idx] / qs   # (n_level,)
+        met, rad = self.gen_met()
+        results = {}
 
-        if ax is None:
-            _, ax = plt.subplots(figsize=(5, 6))
+        direction_map = {
+            "none": 0,
+            "descend": -1,
+            "climb": 1,
+        }
 
-        ax.plot(rhi, self.met_alts / 1e3, "b-o", ms=4)
-        ax.axvline(1.0, color="k", linestyle="--", linewidth=1.5, label="RHi = 1")
-        ax.set_xlabel("RHi [–]")
-        ax.set_ylabel("Altitude [km]")
-        ax.set_title(f"RHi vertical profile  (lon = {lon:.2f}°)")
-        ax.legend()
-        return ax
+        for _, row in flight_cases.iterrows():
+            case_name = row["case"]
 
-    def plot_strategy_comparison(
-        self,
-        results: dict[str, dict] | None = None,
-        **cocip_kwargs,
-    ) -> plt.Figure:
-        """
-        Bar chart comparing total EF and mean fuel flow across strategies.
+            direction = direction_map[row["avoidance"]]
 
-        Parameters
-        ----------
-        results : dict, optional
-            Output of :meth:`run_all_strategies`. Computed if not given.
-        **cocip_kwargs
-            Forwarded to :meth:`run_all_strategies` if *results* is ``None``.
+            alt_target = row["alt_target"]
+            if pd.isna(alt_target):
+                alt_target = None
 
-        Returns
-        -------
-        matplotlib.figure.Figure
-        """
-        if results is None:
-            results = self.run_all_strategies(**cocip_kwargs)
+            fl = self.gen_flight(
+                alt=float(row["alt"]),
+                alt_target=alt_target,
+                direction=direction,
+                pct_blend=float(row["pct_blend"]),
+            )
 
-        strategies = list(results.keys())
-        efs = [results[s]["ef"] for s in strategies]
-        fuels = [
-            results[s]["fuel_burn_mean"] or 0.0
-            for s in strategies
-        ]
+            
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            fl_out, contrail = self.run_cocip(
+                fl,
+                met=met,
+                rad=rad,
+                **cocip_kwargs,
+            )
 
-        colours = ["C0", "C1", "C2", "C3"]
-        axes[0].bar(strategies, efs, color=colours)
-        axes[0].set_xlabel("Strategy")
-        axes[0].set_ylabel("Total EF [J]")
-        axes[0].set_title("Contrail energy forcing")
+            print(fl_out.dataframe.columns)
 
-        axes[1].bar(strategies, fuels, color=colours)
-        axes[1].set_xlabel("Strategy")
-        axes[1].set_ylabel("Mean fuel flow [kg s⁻¹]")
-        axes[1].set_title("Fuel burn")
+            results[case_name] = {
+                "inputs": row.to_dict(),
+                "flight": fl_out,
+                "contrail": contrail,
+            }
 
-        fig.suptitle("Avoidance strategy comparison", fontweight="bold")
-        fig.tight_layout()
-        return fig
+        return results
 
+    def summarise_results(self, results: dict) -> pd.DataFrame:
+        rows = []
 
-# ---------------------------------------------------------------------------
-# Quick-start entry point
-# ---------------------------------------------------------------------------
+        for case_name, result in results.items():
+            inputs = result["inputs"]
+            fl = result["flight"]
+            con = result["contrail"]
 
-if __name__ == "__main__":
-    # Customise any parameters here before running
-    sim_params = SimParams(
-        lon_bounds=(0.0, 8.0),        # extra room for eastward wind advection
-        lat_bounds=(0.0, 2.0),
-        alt_bounds=(10000.0, 14000.0),  # covers ±1500 m avoidance from 12 km ISSR
-        hres_sim=0.25,
-        vres_sim=500.0,
-    )
-    issr_params = ISSRParams(
-        issr_centroid=(2.0, 1.0, 12000.0),
-        sigma_parallel=150_000.0,
-        sigma_perp=50_000.0,
-        sigma_z=3000.0,
-        rhi_bg=0.75,
-        rhi_peak=1.20,
-    )
+            fl_df = fl.dataframe
 
-    sim = ISSRAvoidance(sim_params=sim_params, issr_params=issr_params)
+            if con is None or con.empty:
+                total_ef = 0.0
+                mean_lw_rf = np.nan
+                contrail_points = 0
+            else:
+                total_ef = float(con["ef"].sum()) if "ef" in con.columns else 0.0
+                mean_lw_rf = float(con["rf_lw"].mean()) if "rf_lw" in con.columns else np.nan
+                contrail_points = len(con)
 
-    # --- Visualise the synthetic ISSR before running CoCiP ---
-    print("Plotting ISSR field …")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-    sim.plot_rhi(ax=axes[0])
-    sim.plot_rhi_vertical(ax=axes[1])
-    fig.tight_layout()
-    plt.savefig("issr_field.png", dpi=150)
-    print("Saved issr_field.png")
+            mean_fuel_flow = (
+                float(fl_df["fuel_flow"].mean())
+                if "fuel_flow" in fl_df.columns
+                else np.nan
+            )
 
-    # --- Run full preprocessing (PS model + emissions) ---
-    sim.preprocess()
+            max_fuel_flow = float(fl_df["fuel_flow"].max()) if "fuel_flow" in fl_df.columns else np.nan
+            min_altitude = float(fl_df["altitude"].min())
+            max_altitude = float(fl_df["altitude"].max())
 
-    # --- Run all four avoidance strategies ---
-    results = sim.run_all_strategies()
+            rows.append({
+                "case": case_name,
+                "altitude_m": inputs["alt"],
+                "target_altitude_m": inputs["alt_target"],
+                "avoidance": inputs["avoidance"],
+                "saf_blend_pct": inputs["pct_blend"],
+                "total_ef_J": total_ef,
+                "mean_lw_rf_W_m2": mean_lw_rf,
+                "contrail_points": contrail_points,
+                "mean_fuel_flow_kg_s": mean_fuel_flow,
+                "max_fuel_flow_kg_s": max_fuel_flow,
+                "min_altitude_m": min_altitude,
+                "max_altitude_m": max_altitude,
+            })
 
-    # --- Print comparison table ---
-    df = sim.compare_strategies(results)
-    print("\nStrategy comparison:")
-    print(df.to_string())
+        return pd.DataFrame(rows).set_index("case")
 
-    # --- Save comparison figure ---
-    fig = sim.plot_strategy_comparison(results)
-    plt.savefig("strategy_comparison.png", dpi=150)
-    print("Saved strategy_comparison.png")
+    def save_results(self, results, summary, output_dir="results"):
+        import os
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        summary.to_csv(f"{output_dir}/summary.csv")
+
+        for case_name, result in results.items():
+            flight_df = result["flight"].dataframe
+            flight_df.to_csv(f"{output_dir}/flight_{case_name}.csv", index=False)
+
+            contrail = result["contrail"]
+            if contrail is not None and not contrail.empty:
+                contrail.to_csv(f"{output_dir}/contrail_{case_name}.csv", index=False)
+
+        # Save ISSR field for reproducibility
+        rhi = self._rhi_field()
+        np.save(f"{output_dir}/rhi_field.npy", rhi)
