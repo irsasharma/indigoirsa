@@ -9,14 +9,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import xarray as xr
-import plotly.graph_objects as go
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Literal
 
 from pyproj import Transformer
 from pycontrails import Flight, MetDataset
-from pycontrails.core.fuel import SAFBlend
+from pycontrails.core.fuel import JetA
 from pycontrails.models.emissions import Emissions
 from pycontrails.models.ps_model import PSFlight
 from pycontrails.physics import units
@@ -71,7 +70,6 @@ class SimParams:
 class FlParams:
     """Flight parameters."""
     ac_type: str = "A320"
-    pct_blend: float = 0.0        # SAF blend [%]
     target_alt: float = None      # cruise altitude [m]; None -> domain midpoint
     alt_delta: float = 1000.0     # altitude shift for S1/S2 [m]
     fl_lon_bounds: tuple = (0.0, 4.0)
@@ -146,7 +144,6 @@ class ContrailSimulator:
             start=sp.t_start, end=sp.t_start + sp.duration_met, freq=sp.dt_met
         )
 
-
     def _rhi_field(self):
         """Gaussian RHi field. Returns shape (n_lon, n_lat, n_level)."""
         ip = self.issr_params
@@ -168,7 +165,11 @@ class ContrailSimulator:
         return ip.rhi_bg + (ip.rhi_peak - ip.rhi_bg) * M
 
     def _q_field(self):
-        """RHi -> specific humidity, broadcast over time."""
+        """
+        RHi -> specific humidity, broadcast over time.
+        
+        Returns shape (n_lon, n_lat, n_level, n_time).
+        """
         T = self.met_params.air_temperature
         qs = q_sat_ice(T, self.met_levels * 100.0)
         rhi = self._rhi_field()
@@ -242,7 +243,7 @@ class ContrailSimulator:
 
         return met, rad
 
-    def gen_flight(self, alt=None, alt_target=None, direction=0, avoid_frac=None, pct_blend=None):
+    def gen_flight(self, alt=None, alt_target=None, direction=0, avoid_frac=None):
         """
         Generate a flight trajectory with optional ISSR avoidance.
 
@@ -263,15 +264,11 @@ class ContrailSimulator:
             Fraction of the Gaussian to avoid [0-1].
             0 = no diversion; 1 = avoid entire sigma region.
             Defaults to fl_params.avoid_frac.
-        pct_blend : float, optional
-            SAF blend [%]. Defaults to fl_params.pct_blend.
         """
         sim_params, fl_params, issr_params = self.sim_params, self.fl_params, self.issr_params
 
         if alt is None:
             alt = fl_params.target_alt or 0.5 * (sim_params.alt_bounds[0] + sim_params.alt_bounds[1])
-        if pct_blend is None:
-            pct_blend = fl_params.pct_blend
         if avoid_frac is None:
             avoid_frac = fl_params.avoid_frac
 
@@ -328,7 +325,7 @@ class ContrailSimulator:
         return Flight(
             data=df,
             attrs={"aircraft_type": fl_params.ac_type, "flight_id": "synthetic_fl_001"},
-            fuel=SAFBlend(pct_blend),
+            fuel=JetA(),
         )
 
     def run_cocip(self, fl, met=None, rad=None, **cocip_kwargs):
@@ -366,9 +363,8 @@ class ContrailSimulator:
             alt
             alt_target
             avoidance
-            pct_blend
         """
-        required = {"case", "alt", "alt_target", "avoidance", "pct_blend"}
+        required = {"case", "alt", "alt_target", "avoidance"}
         missing = required - set(flight_cases.columns)
 
         if missing:
@@ -402,7 +398,6 @@ class ContrailSimulator:
                 alt=float(row["alt"]),
                 alt_target=alt_target,
                 direction=direction,
-                pct_blend=float(row["pct_blend"]),
             )
 
             
@@ -458,7 +453,6 @@ class ContrailSimulator:
                 "altitude_m": inputs["alt"],
                 "target_altitude_m": inputs["alt_target"],
                 "avoidance": inputs["avoidance"],
-                "saf_blend_pct": inputs["pct_blend"],
                 "total_ef_J": total_ef,
                 "mean_lw_rf_W_m2": mean_lw_rf,
                 "contrail_points": contrail_points,
