@@ -21,6 +21,7 @@ from pycontrails.models.ps_model import PSFlight
 from pycontrails.physics import units
 from pycontrails.models.cocip import Cocip
 from pycontrails.models.humidity_scaling import ExponentialBoostHumidityScaling
+from pycontrails.physics import geo
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,9 @@ def q_sat_ice(T, p_Pa):
     eps = 0.6220
     e_sat = 611.2 * np.exp(22.46 * (T - 273.16) / (T - 0.55))
     return eps * e_sat / (p_Pa - e_sat)
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,32 @@ class ContrailSimulator:
         n_t = len(self.times_met)
         return np.broadcast_to(q_3d[..., None], q_3d.shape + (n_t,)).copy()
 
+    def _calc_sdr(self, lons, lats, times):
+        times_np = np.asarray(times, dtype="datetime64[ns]")
+
+        lon_grid, lat_grid, time_grid = np.meshgrid(
+            lons,
+            lats,
+            times_np,
+            indexing="ij",
+        )
+
+        sdr = geo.solar_direct_radiation(
+            lon_grid,
+            lat_grid,
+            time_grid,
+        )
+
+        albedo = 0.30
+        olr = 240.0  # W m-2
+        dt_s = self.sim_params.dt_met.total_seconds()
+
+        sw = (1.0 - albedo) * sdr * dt_s
+        lw = np.full_like(sw, -olr * dt_s)
+
+        return sw, lw
+
+
     def gen_met(self):
         """
         Build synthetic meteorology and radiation datasets.
@@ -218,6 +248,8 @@ class ContrailSimulator:
         )
         met = MetDataset(ds)
 
+        sw, lw = self._calc_sdr(lons, lats, times)
+
         # Radiation (single-level) — nighttime: solar = 0, standard OLR
         shape3  = (n_lon, n_lat, n_t)
         dims3   = ["longitude", "latitude", "time"]
@@ -226,12 +258,12 @@ class ContrailSimulator:
         ds_rad = xr.Dataset(
             {
                 "top_net_solar_radiation": xr.DataArray(
-                    np.zeros(shape3, dtype="float32"),
+                    sw.astype("float32"),
                     dims=dims3,
                     attrs={"units": "J m**-2"},
                 ),
                 "top_net_thermal_radiation": xr.DataArray(
-                    np.full(shape3, -8.64e5, dtype="float32"),
+                    lw.astype("float32"),
                     dims=dims3,
                     attrs={"units": "J m**-2"},
                 ),
